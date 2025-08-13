@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Viral Polish — Browser Video Enhancer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font: 16px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+    header { margin-bottom: 16px; }
+    fieldset { border: 1px solid #ddd; padding: 12px; border-radius: 8px; margin-bottom: 16px; }
+    label { display: block; margin: 8px 0 4px; }
+    input[type="file"] { margin-bottom: 8px; }
+    button { padding: 10px 14px; border-radius: 8px; border: 0; cursor: pointer; }
+    #run { background: #111; color: #fff; }
+    #log { white-space: pre-wrap; background: #f6f6f6; padding: 8px; border-radius: 6px; height: 140px; overflow: auto; }
+    .row { display:flex; gap:12px; align-items: center; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Viral Polish</h1>
+    <p>All processing happens locally in your browser using ffmpeg.wasm.</p>
+  </header>
+
+  <fieldset>
+    <legend>1) Source</legend>
+    <label>Video file
+      <input type="file" id="videoFile" accept="video/*" />
+    </label>
+    <label>Optional subtitles (.srt)
+      <input type="file" id="srtFile" accept=".srt" />
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>2) Output & framing</legend>
+    <div class="row">
+      <label>Aspect
+        <select id="aspect">
+          <option value="9:16">9:16 (Vertical / Reels, TikTok)</option>
+          <option value="1:1">1:1 (Square)</option>
+          <option value="4:5">4:5 (IG feed)</option>
+          <option value="16:9">16:9 (YouTube)</option>
+        </select>
+      </label>
+      <label>Target length (sec, optional)
+        <input id="trim" type="text" placeholder="e.g. 28 or 00:00:28" />
+      </label>
+      <label>Start at (sec)
+        <input id="start" type="text" placeholder="e.g. 0 or 00:00:00" value="0" />
+      </label>
+      <label>FPS
+        <select id="fps">
+          <option>30</option>
+          <option selected>60</option>
+        </select>
+      </label>
+      <label>Resolution
+        <select id="res">
+          <option value="1080x1920">1080x1920 (Full HD vertical)</option>
+          <option value="720x1280">720x1280</option>
+          <option value="1920x1080">1920x1080 (Full HD horizontal)</option>
+        </select>
+      </label>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>3) Enhancement preset</legend>
+    <div class="row">
+      <label>Look
+        <select id="look">
+          <option value="clean">Clean pop</option>
+          <option value="warm">Warm punch</option>
+          <option value="cool">Cool crisp</option>
+          <option value="flat">Minimal</option>
+        </select>
+      </label>
+      <label>NR (denoise)
+        <select id="denoise">
+          <option value="off">Off</option>
+          <option value="light" selected>Light</option>
+          <option value="medium">Medium</option>
+        </select>
+      </label>
+      <label>Sharpen
+        <select id="sharpen">
+          <option value="off">Off</option>
+          <option value="light" selected>Light</option>
+          <option value="medium">Medium</option>
+        </select>
+      </label>
+      <label>Loudness normalize
+        <select id="loud">
+          <option value="on" selected>On (–16 LUFS)</option>
+          <option value="off">Off</option>
+        </select>
+      </label>
+      <label>Auto captions
+        <select id="burnsubs">
+          <option value="off" selected>Off</option>
+          <option value="on">Burn in .srt (if provided)</option>
+        </select>
+      </label>
+    </div>
+  </fieldset>
+
+  <div class="row">
+    <button id="run">Render</button>
+    <a id="download" download="viral-polish.mp4" style="display:none">Download output</a>
+  </div>
+
+  <h3>Log</h3>
+  <div id="log"></div>
+
+  <script type="module">
+    import { createFFmpeg, fetchFile } from "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/ffmpeg.min.js";
+
+    const logEl = document.getElementById('log');
+    const outLink = document.getElementById('download');
+    const ffmpeg = createFFmpeg({ log: true, corePath: "https://unpkg.com/@ffmpeg/core@0.12.10/dist/ffmpeg-core.js" });
+    const log = (m) => { logEl.textContent += m + "\\n"; logEl.scrollTop = logEl.scrollHeight; };
+
+    const looks = {
+      clean: 'eq=contrast=1.05:brightness=0.02:saturation=1.18:gamma=1.0',
+      warm:  'eq=contrast=1.08:brightness=0.03:saturation=1.22:gamma=1.0, curves=vintage',
+      cool:  'eq=contrast=1.07:brightness=0.01:saturation=1.10:gamma=1.02, colorbalance=bs=0.03',
+      flat:  'eq=contrast=1.00:brightness=0.00:saturation=1.00:gamma=1.00'
+    };
+    const dn = {
+      off: '',
+      light: 'hqdn3d=1.2:1.2:6:6',
+      medium: 'hqdn3d=2.5:2.5:8:8'
+    };
+    const sharp = {
+      off: '',
+      light: 'unsharp=lx=5:ly=5:la=0.6:cx=5:cy=5:ca=0.6',
+      medium: 'unsharp=lx=7:ly=7:la=0.8:cx=7:cy=7:ca=0.8'
+    };
+
+    function aspectToPad(aspect, targetW, targetH) {
+      const [aw, ah] = aspect.split(':').map(Number);
+      const targetAR = targetW / targetH;
+      const desiredAR = aw / ah;
+      // We'll scale to fit height, then pad/crop to exact.
+      // Using scale with force_original_aspect_ratio=decrease, then pad/crop via crop filter.
+      return { desiredAR };
+    }
+
+    document.getElementById('run').addEventListener('click', async () => {
+      const vFile = document.getElementById('videoFile').files[0];
+      if (!vFile) { alert('Please choose a video file'); return; }
+      const srtFile = document.getElementById('srtFile').files[0];
+      const aspect = document.getElementById('aspect').value;
+      const res = document.getElementById('res').value; // e.g. 1080x1920
+      const fps = document.getElementById('fps').value;
+      const start = (document.getElementById('start').value || '0').trim();
+      const trim = (document.getElementById('trim').value || '').trim();
+      const look = document.getElementById('look').value;
+      const denoise = document.getElementById('denoise').value;
+      const sharpen = document.getElementById('sharpen').value;
+      const loud = document.getElementById('loud').value;
+      const burnsubs = document.getElementById('burnsubs').value;
+
+      outLink.style.display = 'none';
+      logEl.textContent = '';
+
+      if (!ffmpeg.isLoaded()) {
+        log('Loading ffmpeg.wasm (first time can take a bit)…');
+        await ffmpeg.load();
+      }
+
+      // Write inputs
+      ffmpeg.FS('writeFile', 'in.mp4', await fetchFile(vFile));
+      if (srtFile) {
+        ffmpeg.FS('writeFile', 'in.srt', await fetchFile(srtFile));
+      }
+
+      // Build video filter chain
+      const [w, h] = res.split('x').map(Number);
+      const vf = [];
+
+      // Scale down/up to fit inside target, preserve AR
+      vf.push(`scale=${w}:${h}:force_original_aspect_ratio=decrease`);
+      // Pad to exact size (letterbox) then center-crop to exact (safe for both orientations)
+      vf.push(`pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black`);
+      vf.push(`crop=${w}:${h}`);
+
+      // Enhancements
+      if (dn[denoise]) vf.push(dn[denoise]);
+      if (looks[look]) vf.push(looks[look]);
+      if (sharp[sharpen]) vf.push(sharp[sharpen]);
+
+      // Optional burned-in subs
+      if (burnsubs === 'on' && srtFile) {
+        // Convert SRT to UTF-8 if needed and burn
+        vf.push(`subtitles=in.srt:force_style='FontName=Arial,FontSize=36,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=1,Shadow=0,MarginV=48'`);
+      }
+
+      const args = [
+        '-ss', start,
+        ...(trim ? ['-t', trim] : []),
+        '-i', 'in.mp4',
+        ...(srtFile ? ['-i', 'in.srt'] : []), // not strictly needed for burn, but harmless
+        '-r', fps,
+        '-vf', vf.join(','),
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-crf', '20',
+        ...(loud === 'on' ? ['-af', 'loudnorm=I=-16:TP=-1.5:LRA=11'] : []),
+        '-movflags', '+faststart',
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', '192k',
+        'out.mp4'
+      ];
+
+      log('Running ffmpeg with filters: \\n' + vf.join(', ') + '\\n');
+      try {
+        await ffmpeg.run(...args);
+        const data = ffmpeg.FS('readFile', 'out.mp4');
+        const url = URL.createObjectURL(new Blob([data.buffer], { type: 'video/mp4' }));
+        outLink.href = url;
+        outLink.style.display = 'inline-block';
+        outLink.textContent = 'Download output';
+        log('Done. Click "Download output".');
+      } catch (e) {
+        console.error(e); log('Error: ' + e.message);
+      }
+    });
+  </script>
+</body>
+</html>
